@@ -22,8 +22,16 @@ struct file {
     string file_path;
 };
 
+struct download_task {
+    int chunk_no;
+    bool completed;
+    string peer_ip;
+    string peer_port;
+};
+
 map<string, file> local_files;
 mutex file_mutex;
+mutex cout_mutex;
 string current_user;
 string peer_ip, peer_port;
 bool is_logged_in = false;
@@ -131,16 +139,13 @@ void share_chunk(int sockfd){
         return;
     }
 
-    // Send chunk size first
     string size_msg = to_string(bytes_read);
     send(sockfd, size_msg.c_str(), size_msg.size(), 0);
     
-    // Wait for acknowledgment
     char ack[10];
     memset(ack, 0, sizeof(ack));
     recv(sockfd, ack, sizeof(ack), 0);
 
-    // Send actual chunk data
     ssize_t sent = 0;
     ssize_t total_sent = 0;
     while (total_sent < bytes_read) {
@@ -170,21 +175,21 @@ void peer_connection(string ip, string port){
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(stoi(port)); 
-    
+
     if(bind(listen_sock, (struct sockaddr *) &addr, sizeof(addr)) == -1){ 
         cout << "Error in binding" << endl;
         close(listen_sock);
         return;
     }
-    
+
     if(listen(listen_sock, 10) == -1){ 
         cout << "Error in listen" << endl;
         close(listen_sock);
         return;
     }
-    
+
     cout << "Peer server listening on port " << port << endl;
-    
+
     socklen_t len = sizeof(addr);
     while(1){
         int new_sock;
@@ -206,7 +211,7 @@ bool download_chunk_from_peer(string peer_ip, string peer_port, string filename,
     bzero((char *) &serv_addr, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(stoi(peer_port));
-    
+
     if (inet_pton(AF_INET, peer_ip.c_str(), &serv_addr.sin_addr) <= 0) {
         close(sockfd);
         return false;
@@ -223,14 +228,12 @@ bool download_chunk_from_peer(string peer_ip, string peer_port, string filename,
         return false;
     }
 
-    // Request chunk
     string msg = "get_chunk " + filename + " " + to_string(chunk_no);
     if (send(sockfd, msg.c_str(), msg.size(), 0) <= 0) {
         close(sockfd);
         return false;
     }
 
-    // Receive chunk size
     char size_buffer[64];
     memset(size_buffer, 0, sizeof(size_buffer));
     ssize_t n = recv(sockfd, size_buffer, sizeof(size_buffer), 0);
@@ -239,18 +242,16 @@ bool download_chunk_from_peer(string peer_ip, string peer_port, string filename,
         return false;
     }
     size_buffer[n] = '\0';
-    
+
     int chunk_size = atoi(size_buffer);
     if (chunk_size <= 0 || chunk_size > CHUNK_SIZE) {
         close(sockfd);
         return false;
     }
 
-    // Send acknowledgment
     string ack = "OK";
     send(sockfd, ack.c_str(), ack.size(), 0);
 
-    // Receive chunk data
     memset(chunk_buffer, 0, CHUNK_SIZE);
     int total_received = 0;
     while (total_received < chunk_size) {
@@ -274,6 +275,87 @@ bool verify_chunk_hash(char* chunk_data, int size, string expected_hash) {
     hash_hex[40] = '\0';
 
     return (expected_hash == string(hash_hex));
+}
+
+void peer_download_thread(string peer_ip, string peer_port, string filename, vector<string>& chunk_hashes,
+    int dest_fd, int& chunks_completed, int total_chunks, vector<bool>& chunks_downloaded,
+    mutex& download_mutex, int& next_chunk_index) {
+    const int MAX_RETRIES = 3;
+
+    while (true) {
+        download_mutex.lock();
+        int chunk_no = next_chunk_index;
+
+        if (chunk_no >= total_chunks) {
+            download_mutex.unlock();
+            break;
+        }
+
+        next_chunk_index++;
+        download_mutex.unlock();
+
+        char chunk_buffer[CHUNK_SIZE];
+        int bytes_received = 0;
+        bool downloaded = false;
+        int retry_count = 0;
+
+        while (!downloaded && retry_count < MAX_RETRIES) {
+            if (download_chunk_from_peer(peer_ip, peer_port, filename, chunk_no, chunk_buffer, bytes_received)) {
+                if (chunk_no < chunk_hashes.size() && verify_chunk_hash(chunk_buffer, bytes_received, chunk_hashes[chunk_no])) {
+                    download_mutex.lock();
+                    off_t offset = (off_t)chunk_no * CHUNK_SIZE;
+                    lseek(dest_fd, offset, SEEK_SET);
+                    write(dest_fd, chunk_buffer, bytes_received);
+
+                    chunks_downloaded[chunk_no] = true;
+                    chunks_completed++;
+
+                    int progress = (chunks_completed * 100) / total_chunks;
+                    download_mutex.unlock();
+
+                    cout_mutex.lock();
+                    cout << "[" << peer_ip << ":" << peer_port << "] Downloaded chunk " 
+                    << (chunk_no + 1) << "/" << total_chunks << " | Overall Progress: " 
+                    << progress << "%" << endl;
+                    cout_mutex.unlock();
+                    
+                    downloaded = true;
+                } else {
+                    retry_count++;
+                    cout_mutex.lock();
+                    cout << "[PEER " << peer_ip << ":" << peer_port << "] Chunk " << (chunk_no + 1) 
+                         << " hash verification failed (Retry " << retry_count << "/" << MAX_RETRIES << ")" << endl;
+                    cout_mutex.unlock();
+                }
+            } else {
+                retry_count++;
+                if (retry_count < MAX_RETRIES) {
+                    cout_mutex.lock();
+                    cout << "[PEER " << peer_ip << ":" << peer_port << "] ⚠ Failed to download chunk " 
+                         << (chunk_no + 1) << " (Retry " << retry_count << "/" << MAX_RETRIES << ")" << endl;
+                    cout_mutex.unlock();
+                }
+            }
+        }
+
+        if (!downloaded) {
+            cout_mutex.lock();
+            cout << "[PEER " << peer_ip << ":" << peer_port << "] Failed to download chunk " 
+                 << (chunk_no + 1) << " after " << MAX_RETRIES << " retries" << endl;
+            cout_mutex.unlock();
+
+            download_mutex.lock();
+            if (next_chunk_index > chunk_no + 1) {
+                next_chunk_index = chunk_no;
+            }
+            download_mutex.unlock();
+            break;
+        }
+    }
+
+    cout_mutex.lock();
+    cout << "[PEER " << peer_ip << ":" << peer_port << "] Thread finished" << endl;
+    cout_mutex.unlock();
 }
 
 int main(int argc, char *argv[]) {
@@ -332,14 +414,9 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    // Start peer connection thread
     thread peer_thread(peer_connection, client_ip, client_port);
     peer_thread.detach();
 
-    int log_fd = open("client_log.txt", O_RDWR | O_APPEND | O_CREAT, 0644);
-    if(log_fd < 0)
-        error("Unable to open the file");
-    
     while (1) {
         string line_read;
         cout << "$> ";
@@ -369,7 +446,6 @@ int main(int argc, char *argv[]) {
                 is_logged_in = true;
                 current_user = words[1];
                 
-                // Register peer address with tracker
                 string peer_msg = "register_peer " + peer_ip + " " + peer_port;
                 string peer_reply = ssend_message(sockfd, peer_msg);
                 cout << "Peer registration: " << peer_reply << endl;
@@ -421,7 +497,7 @@ int main(int argc, char *argv[]) {
                 cout << "Please login first" << endl;
                 continue;
             }
-            
+
             string group_id = words[1];
             string file_path = words[2];
             string filename = filepath_to_filename(file_path);
@@ -438,12 +514,12 @@ int main(int argc, char *argv[]) {
                 close(fd);
                 error("Issue with file size");
             }
-            
+
             int chunks_count = file_size / CHUNK_SIZE;
             int last_chunk_size = file_size % CHUNK_SIZE;
             if (last_chunk_size > 0)
                 chunks_count++;
-                
+
             cout << "Uploading file: " << filename << endl;
             cout << "File Size: " << file_size << " bytes" << endl;
             cout << "Number of chunks: " << chunks_count << endl;
@@ -481,15 +557,15 @@ int main(int argc, char *argv[]) {
                 sprintf(file_hash + (i * 2), "%02x", file_hash_raw[i]);
             file_hash[SHA_DIGEST_LENGTH * 2] = '\0';
             close(fd);
-            
+
             string msg = "upload_file " + group_id + " " + filename + " " + file_path + " " +
                         to_string(file_size) + " " + to_string(chunks_count) + " " + file_hash + " ";
             for (int i = 0; i < chunk_hashes.size(); i++)
                 msg += chunk_hashes[i] + " ";
-                
+
             string reply = ssend_message(sockfd, msg);
             cout << reply << endl;
-            
+
             if (reply.find("successfully") != string::npos) {
                 file fl;
                 fl.file_name = filename;
@@ -499,7 +575,7 @@ int main(int argc, char *argv[]) {
                 fl.chunk_hashes = chunk_hashes;
                 fl.chunks_downloaded = vector<bool>(chunks_count, true);
                 fl.file_path = file_path;
-                
+
                 file_mutex.lock();
                 local_files[filename] = fl;
                 file_mutex.unlock();
@@ -510,7 +586,7 @@ int main(int argc, char *argv[]) {
                 cout << "Please login first" << endl;
                 continue;
             }
-            
+
             string group_id = words[1];
             string file_name = words[2];
             string destination_path = words[3];
@@ -522,20 +598,19 @@ int main(int argc, char *argv[]) {
                 cout << reply << endl;
                 continue;
             }
-            
+
             vector<string> response_parts;
             char* tok = strtok(const_cast<char*>(reply.c_str()), " ");
             while (tok != NULL) {
                 response_parts.push_back(tok);
                 tok = strtok(NULL, " ");
             }
-            
+
             if (response_parts.size() < 3) {
                 cout << "Invalid response from tracker" << endl;
                 continue;
             }
-            
-            // Parse response: file_size chunks_count file_hash chunk_hashes... peer_list
+
             long file_size = stol(response_parts[0]);
             int chunks_count = stoi(response_parts[1]);
             string file_hash = response_parts[2];
@@ -545,8 +620,8 @@ int main(int argc, char *argv[]) {
                 if (i < response_parts.size())
                     chunk_hashes.push_back(response_parts[i]);
             }
-            
-            vector<pair<string, string>> peers; // ip:port pairs
+
+            vector<pair<string, string>> peers;
             for (int i = 3 + chunks_count; i < response_parts.size(); i++) {
                 string peer_info = response_parts[i];
                 size_t colon_pos = peer_info.find(':');
@@ -556,18 +631,16 @@ int main(int argc, char *argv[]) {
                     peers.push_back({ip, port});
                 }
             }
-            
+
             if (peers.empty()) {
                 cout << "No peers available for download" << endl;
                 continue;
             }
-            
-            cout << "\nStarting download of " << file_name << endl;
+            cout << "Starting download of " << file_name << endl;
             cout << "File size: " << file_size << " bytes" << endl;
             cout << "Chunks: " << chunks_count << endl;
             cout << "Available peers: " << peers.size() << endl;
             
-            // Create destination file path
             string dest_file = destination_path;
             if (dest_file.back() != '/')
                 dest_file += "/";
@@ -578,54 +651,39 @@ int main(int argc, char *argv[]) {
                 cout << "Cannot create destination file at " << dest_file << endl;
                 continue;
             }
-            if (ftruncate(dest_fd, file_size) < 0) {
-                perror("ftruncate");
-                close(dest_fd);
-                continue;
-            }
+            
             vector<bool> chunks_downloaded(chunks_count, false);
             int chunks_completed = 0;
+            int next_chunk_index = 0;
+            mutex download_mutex;
             
-            // Download chunks
-            for (int chunk_no = 0; chunk_no < chunks_count; chunk_no++) {
-                bool chunk_success = false;
-                char chunk_buffer[CHUNK_SIZE];
-                int bytes_received = 0;
+            vector<thread> download_threads;
+
+            cout << "Seeders available are" << endl;
+            for (int i = 0; i < peers.size(); i++) {
+                auto& peer = peers[i];
                 
-                // Try downloading from available peers
-                for (auto& peer : peers) {
-                    if (download_chunk_from_peer(peer.first, peer.second, file_name, chunk_no, chunk_buffer, bytes_received)) {
-                        // Verify chunk hash
-                        if (chunk_no < chunk_hashes.size() && verify_chunk_hash(chunk_buffer, bytes_received, chunk_hashes[chunk_no])) {
-                            // Write chunk to file
-                            off_t offset = (off_t)chunk_no * CHUNK_SIZE;
-                            // lseek(dest_fd, offset, SEEK_SET);
-                            // write(dest_fd, chunk_buffer, bytes_received);
-                            pwrite(dest_fd, chunk_buffer, bytes_received, offset);
-                            chunks_downloaded[chunk_no] = true;
-                            chunks_completed++;
-                            chunk_success = true;
-                            
-                            cout << "Downloaded chunk " << (chunk_no + 1) << "/" << chunks_count << " (" 
-                                 << (chunks_completed * 100 / chunks_count) << "%)" << endl;
-                            break;
-                        } else {
-                            cout << "Chunk " << (chunk_no + 1) << " hash verification failed, retrying..." << endl;
-                        }
-                    }
-                }
+                cout_mutex.lock();
+                cout << peer.first << ":" << peer.second << endl;
+                cout_mutex.unlock();
                 
-                if (!chunk_success) {
-                    cout << "Failed to download chunk " << (chunk_no + 1) << endl;
-                }
+                download_threads.push_back(thread(peer_download_thread, peer.first, peer.second,
+                    file_name, ref(chunk_hashes), dest_fd, ref(chunks_completed), chunks_count,
+                    ref(chunks_downloaded), ref(download_mutex), ref(next_chunk_index)));
+            }
+
+            cout << "\nAll peer threads started Downloading\n" << endl;
+
+            for (auto& t : download_threads) {
+                if (t.joinable())
+                    t.join();
             }
             
             close(dest_fd);
             
             if (chunks_completed == chunks_count) {
-                cout << "\n[C] [" << group_id << "] " << file_name << endl;
-                cout << "Download completed successfully!\n" << endl;
-                
+                cout << "Download completed successfully!" << endl;
+
                 file fl;
                 fl.file_name = file_name;
                 fl.file_size = file_size;
@@ -634,39 +692,16 @@ int main(int argc, char *argv[]) {
                 fl.chunk_hashes = chunk_hashes;
                 fl.chunks_downloaded = chunks_downloaded;
                 fl.file_path = dest_file;
-                
                 file_mutex.lock();
                 local_files[file_name] = fl;
                 file_mutex.unlock();
-                
-                // Notify tracker about successful download
+
                 string notify_msg = "download_complete " + group_id + " " + file_name;
                 ssend_message(sockfd, notify_msg);
             } else {
-                cout << "\nDownload incomplete. Completed " << chunks_completed << "/" << chunks_count << " chunks" << endl;
+                cout << "Download incomplete!" << endl;
+                cout << "Completed " << chunks_completed << "/" << chunks_count << " chunks" << endl;
             }
-        }
-        else if (words[0] == "show_downloads" && words.size() == 1) {
-            file_mutex.lock();
-            if (local_files.empty()) {
-                cout << "No files available" << endl;
-            } else {
-                cout << "\nLocal Files:" << endl;
-                cout << "-------------------------------------------" << endl;
-                for (auto& file_pair : local_files) {
-                    file fl = file_pair.second;
-                    int completed = 0;
-                    for (bool status : fl.chunks_downloaded) {
-                        if (status) completed++;
-                    }
-                    cout << "File: " << fl.file_name << endl;
-                    cout << "  Size: " << fl.file_size << " bytes" << endl;
-                    cout << "  Chunks: " << completed << "/" << fl.chunks_count << endl;
-                    cout << "  Path: " << fl.file_path << endl;
-                    cout << "-------------------------------------------" << endl;
-                }
-            }
-            file_mutex.unlock();
         }
         else if (words[0] == "stop_share" && words.size() == 3) {
             string reply = send_message(sockfd, words);
@@ -674,26 +709,9 @@ int main(int argc, char *argv[]) {
         }
         else {
             cout << "Invalid command or arguments" << endl;
-            cout << "Available commands:" << endl;
-            cout << "  create_user <user_id> <password>" << endl;
-            cout << "  login <user_id> <password>" << endl;
-            cout << "  create_group <group_id>" << endl;
-            cout << "  join_group <group_id>" << endl;
-            cout << "  leave_group <group_id>" << endl;
-            cout << "  list_groups" << endl;
-            cout << "  list_requests <group_id>" << endl;
-            cout << "  accept_request <group_id> <user_id>" << endl;
-            cout << "  list_files <group_id>" << endl;
-            cout << "  upload_file <group_id> <file_path>" << endl;
-            cout << "  download_file <group_id> <file_name> <destination_path>" << endl;
-            cout << "  show_downloads" << endl;
-            cout << "  stop_share <group_id> <file_name>" << endl;
-            cout << "  logout" << endl;
-            cout << "  quit" << endl;
         }
     }
-    
-    close(log_fd);
+
     close(sockfd);
     return 0;
 }
