@@ -9,6 +9,27 @@
 
 using namespace std;
 
+mutex log_mutex;
+ofstream log_file;
+
+void init_log(const string &filename) {
+    log_file.open(filename, std::ios::app);
+    if (!log_file.is_open()) {
+        cout << "Cannot open log file: " << filename << std::endl;
+        exit(1);
+    }
+}
+
+void log_message(const std::string &msg) {
+    lock_guard<mutex> lock(log_mutex);
+    auto now = chrono::system_clock::now();
+    time_t t = chrono::system_clock::to_time_t(now);
+    tm tm{};
+    localtime_r(&t, &tm);
+    log_file << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "  " << msg << std::endl;
+    log_file.flush();
+}
+
 void error(string msg) {
     perror(msg.c_str());
     exit(1);
@@ -36,14 +57,14 @@ struct file {
     long file_size;
     int chunks_count;
     vector<pair<string,bool>> file_users;	
-    vector<pair<string, string>> peer_addresses; // ip:port pairs
+    vector<pair<string, string>> peer_addresses;
     vector<string> chunk_hashes;
     string file_hash;
 };
 
 map<string, user_info> users;
 map<int, string> session_map;
-map<int, pair<string, string>> peer_info_map; // sockfd -> (ip, port)
+map<int, pair<string, string>> peer_info_map;
 map<string, group> group_map;
 map<string, file> file_map;
 
@@ -81,8 +102,7 @@ void client_handler(int newsockfd) {
         ssize_t n = recv(newsockfd, buffer, sizeof(buffer), 0);
         if (n <= 0) {
             cout << "Client disconnected" << endl;
-            
-            // Clean up session
+
             if (session_map.find(newsockfd) != session_map.end()) {
                 string curr_user = session_map[newsockfd];
                 if (users.find(curr_user) != users.end()) {
@@ -90,11 +110,11 @@ void client_handler(int newsockfd) {
                 }
                 session_map.erase(newsockfd);
             }
-            
+
             if (peer_info_map.find(newsockfd) != peer_info_map.end()) {
                 peer_info_map.erase(newsockfd);
             }
-            
+
             close(newsockfd);
             break;
         }
@@ -114,6 +134,7 @@ void client_handler(int newsockfd) {
             if (users.find(words[1]) == users.end()) {
                 users[words[1]] = {words[1], words[2], false};
                 msg = "User created successfully";
+                log_message("created User: " + words[1]);
             }
             else {
                 msg = "User already exists";
@@ -134,6 +155,7 @@ void client_handler(int newsockfd) {
                     users[words[1]].login_status = true;
                     session_map[newsockfd] = words[1];
                     msg = "login successful";
+                    log_message("User logged in: " + words[1]);
                 }
                 else {
                     msg = "Incorrect Password";
@@ -147,19 +169,17 @@ void client_handler(int newsockfd) {
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
+
             string peer_ip = words[1];
             string peer_port = words[2];
             string curr_user = session_map[newsockfd];
-            
+
             peer_info_map[newsockfd] = {peer_ip, peer_port};
-            
-            // Update peer address for all files owned by this user
+
             for (auto& file_pair : file_map) {
                 file& fl = file_pair.second;
                 for (auto& user_pair : fl.file_users) {
                     if (user_pair.first == curr_user && user_pair.second) {
-                        // Check if peer address already exists
                         bool found = false;
                         for (auto& peer : fl.peer_addresses) {
                             if (peer.first == peer_ip && peer.second == peer_port) {
@@ -173,7 +193,7 @@ void client_handler(int newsockfd) {
                     }
                 }
             }
-            
+
             msg = "Peer address registered";
             send(newsockfd, msg.c_str(), msg.size(), 0);
         }
@@ -189,6 +209,7 @@ void client_handler(int newsockfd) {
                 group gm = {userid, {}, {}, {}};
                 group_map[words[1]] = gm;
                 msg = "Created group Successfully";
+                log_message("Created group: " + words[1]);
             }
             send(newsockfd, msg.c_str(), msg.size(), 0);
         }
@@ -211,7 +232,7 @@ void client_handler(int newsockfd) {
                         break;
                     }
                 }
-                
+
                 if (!already_member) {
                     if (group_info.owner == curr_user) {
                         msg = "You are the owner of the group";
@@ -228,6 +249,7 @@ void client_handler(int newsockfd) {
                         if (!already_requested) {
                             group_info.request.push_back(curr_user);
                             msg = "Join request sent to owner";
+                            log_message("User " + curr_user + " requested to join group " + words[1]);
                         } else {
                             msg = "Request already pending";
                         }
@@ -255,6 +277,7 @@ void client_handler(int newsockfd) {
                     if (itr != gp.member.end()) {
                         gp.member.erase(itr);
                         msg = "Group left successfully";
+                        log_message("User " + curr_user + " left group " + words[1]);
                     }
                     else {
                         msg = "You are not a member of this group";
@@ -313,6 +336,7 @@ void client_handler(int newsockfd) {
                         gp.member.push_back(words[2]);
                         msg = "Request Accepted";
                         flag = true;
+                        log_message("User " + words[2] + " joined group " + words[1]);
                         break;
                     }
                 }
@@ -326,8 +350,7 @@ void client_handler(int newsockfd) {
                 string curr_user = session_map[newsockfd];
                 users[curr_user].login_status = false;
                 session_map.erase(newsockfd);
-                
-                // Remove peer info
+
                 if (peer_info_map.find(newsockfd) != peer_info_map.end()) {
                     peer_info_map.erase(newsockfd);
                 }
@@ -347,16 +370,14 @@ void client_handler(int newsockfd) {
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
+
             string curr_user = session_map[newsockfd];
-            
+
             if(group_map.find(group_id) == group_map.end()){
                 msg = group_id + " group ID doesn't exist";
             }
             else{
                 group& gp = group_map[group_id];
-                
-                // Check if user is member or owner
                 bool is_member = false;
                 if (gp.owner == curr_user) {
                     is_member = true;
@@ -368,27 +389,23 @@ void client_handler(int newsockfd) {
                         }
                     }
                 }
-                
+
                 if (!is_member) {
                     msg = "You are not a member of this group";
                     send(newsockfd, msg.c_str(), msg.size(), 0);
                     continue;
                 }
-                
-                // Parse: upload_file group_id filename filepath file_size chunks_count file_hash chunk_hashes...
+
                 string filename = words[2];
                 string filepath = words[3];
-                
+
                 if(file_map.find(filename) != file_map.end()){
-                    // File exists, check if user already uploaded
                     file& fl = file_map[filename];
                     if(isUserPresent(fl.file_users, curr_user)){
                         msg = "file already has been uploaded by user ID: " + curr_user;
                     }
                     else{
                         fl.file_users.push_back({curr_user, true});
-                        
-                        // Add peer address if available
                         if (peer_info_map.find(newsockfd) != peer_info_map.end()) {
                             auto peer = peer_info_map[newsockfd];
                             bool peer_exists = false;
@@ -402,12 +419,10 @@ void client_handler(int newsockfd) {
                                 fl.peer_addresses.push_back(peer);
                             }
                         }
-                        
                         msg = "file uploaded successfully by user ID: " + curr_user;
                     }
                 }
                 else{
-                    // New file
                     file fl;
                     fl.file_size = stol(words[4]);
                     fl.file_name = filename;
@@ -418,19 +433,17 @@ void client_handler(int newsockfd) {
                     for(int i = 7; i < words.size(); i++) {
                         fl.chunk_hashes.push_back(words[i]);
                     }
-                    
-                    // Add peer address if available
+
                     if (peer_info_map.find(newsockfd) != peer_info_map.end()) {
                         fl.peer_addresses.push_back(peer_info_map[newsockfd]);
                     }
-                    
+
                     file_map[filename] = fl;
-                    
-                    // Add file to group's file list
+
                     if (find(gp.filesinGroup.begin(), gp.filesinGroup.end(), filename) == gp.filesinGroup.end()) {
                         gp.filesinGroup.push_back(filename);
                     }
-                    
+                    log_message("File " + filename + " is uploaded by " + curr_user);
                     msg = "file uploaded successfully by user ID: " + curr_user;
                 }
             }
@@ -446,9 +459,8 @@ void client_handler(int newsockfd) {
             else {
                 group gp = group_map[words[1]];
                 string curr_user = session_map[newsockfd];
-                
-                // Check if user is member or owner
                 bool is_member = false;
+
                 if (gp.owner == curr_user) {
                     is_member = true;
                 } else {
@@ -459,7 +471,7 @@ void client_handler(int newsockfd) {
                         }
                     }
                 }
-                
+
                 if (!is_member) {
                     msg = "You are not a member of this group";
                 } else {
@@ -478,20 +490,19 @@ void client_handler(int newsockfd) {
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
+
             string group_id = words[1];
             string file_name = words[2];
             string curr_user = session_map[newsockfd];
-            
+
             if (group_map.find(group_id) == group_map.end()) {
                 msg = "Error Group does not exist";
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
+
             group gid = group_map[group_id];
-            
-            // Check if user is member or owner
+
             bool is_member = false;
             if (gid.owner == curr_user) {
                 is_member = true;
@@ -503,40 +514,35 @@ void client_handler(int newsockfd) {
                     }
                 }
             }
-            
+
             if (!is_member) {
                 msg = "Error You are not a member of this group";
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
-            // Check if file exists
+
             if (file_map.find(file_name) == file_map.end()) {
                 msg = "Error File not found in group";
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
+
             file fl = file_map[file_name];
-            
-            // Check if any peers have the file
+
             if (fl.file_users.empty()) {
                 msg = "Error No peers available for this file";
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
-            // Build response with file info and peer list
+
             msg = to_string(fl.file_size) + " " + 
                   to_string(fl.chunks_count) + " " + 
                   fl.file_hash + " ";
-            
-            // Add chunk hashes
+
             for (int i = 0; i < fl.chunk_hashes.size(); i++) {
                 msg += fl.chunk_hashes[i] + " ";
             }
-            
-            // Add peer addresses (only active users)
+
             for (auto& peer : fl.peer_addresses) {
                 msg += peer.first + ":" + peer.second + " ";
             }
@@ -544,7 +550,7 @@ void client_handler(int newsockfd) {
             if (fl.peer_addresses.empty()) {
                 msg = "Error No active peers available for this file";
             }
-            
+
             send(newsockfd, msg.c_str(), msg.size(), 0);
         }
         else if (words[0] == "download_complete") {
@@ -553,30 +559,27 @@ void client_handler(int newsockfd) {
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
+
             string group_id = words[1];
             string file_name = words[2];
             string curr_user = session_map[newsockfd];
-            
+
             if (file_map.find(file_name) != file_map.end()) {
                 file& fl = file_map[file_name];
-                
-                // Check if user already in list
+
                 bool found = false;
                 for (auto& user_pair : fl.file_users) {
                     if (user_pair.first == curr_user) {
-                        user_pair.second = true; // Mark as active
+                        user_pair.second = true;
                         found = true;
                         break;
                     }
                 }
-                
-                // Add user if not found
+
                 if (!found) {
                     fl.file_users.push_back({curr_user, true});
                 }
-                
-                // Add peer address if available
+
                 if (peer_info_map.find(newsockfd) != peer_info_map.end()) {
                     auto peer = peer_info_map[newsockfd];
                     bool peer_exists = false;
@@ -590,12 +593,12 @@ void client_handler(int newsockfd) {
                         fl.peer_addresses.push_back(peer);
                     }
                 }
-                
+
                 msg = "Download registered successfully";
             } else {
                 msg = "Error File not found";
             }
-            
+
             send(newsockfd, msg.c_str(), msg.size(), 0);
         }
         else if (words[0] == "stop_share") {
@@ -604,23 +607,21 @@ void client_handler(int newsockfd) {
                 send(newsockfd, msg.c_str(), msg.size(), 0);
                 continue;
             }
-            
+
             string group_id = words[1];
             string file_name = words[2];
             string curr_user = session_map[newsockfd];
             
             if (file_map.find(file_name) != file_map.end()) {
                 file& fl = file_map[file_name];
-                
-                // Mark user as inactive
+
                 for (auto& user_pair : fl.file_users) {
                     if (user_pair.first == curr_user) {
                         user_pair.second = false;
                         break;
                     }
                 }
-                
-                // Remove peer address
+
                 if (peer_info_map.find(newsockfd) != peer_info_map.end()) {
                     auto peer = peer_info_map[newsockfd];
                     auto it = fl.peer_addresses.begin();
@@ -632,12 +633,13 @@ void client_handler(int newsockfd) {
                         }
                     }
                 }
-                
+                log_message("Stopped sharing file " + file_name + " by user " + curr_user +
+                " in group " + group_id);
                 msg = "Stopped sharing file";
             } else {
                 msg = "Error File not found";
             }
-            
+
             send(newsockfd, msg.c_str(), msg.size(), 0);
         }
         else {
@@ -652,6 +654,8 @@ int main(int argc, char *argv[]) {
         cout << "Invalid Arguments" << endl;
         return 0;
     }
+
+    init_log("tracker_log.txt");
 
     char* tracker_fname = argv[1];
     int sno = stoi(argv[2]);
@@ -693,11 +697,6 @@ int main(int argc, char *argv[]) {
     vector<thread> threads_list;
     thread quit_thread(quit_func, 1);
     quit_thread.detach();
-    
-    char buffer[256];
-    int log_fd = open("tracker_log.txt", O_RDWR | O_APPEND | O_CREAT, 0644);
-    if(log_fd < 0)
-        error("Unable to open the file");
 
     while(1) {
         int newsockfd = accept(sockfd, (struct sockaddr *) &client_addr, &cli_len);
@@ -710,8 +709,7 @@ int main(int argc, char *argv[]) {
         threads_list.back().detach();
         cout << "client connection success" << endl;
     }
-    
-    close(log_fd);
+
     close(sockfd);
     return 0;
 }
