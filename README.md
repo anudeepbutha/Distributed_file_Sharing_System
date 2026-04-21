@@ -15,7 +15,7 @@ Run Tracker:
 
 Run Client:
 >./client <IP>:<PORT> tracker_info.txt
-- <IP>:<PORT>: IP and port of the tracker.
+- <IP>:<PORT> IP and port of the tracker.
 - tracker_info.txt: File containing details of all trackers.
 
 User and Group Management
@@ -67,10 +67,3 @@ Architectural Overview
 - Files are divided into fixed-size chunks (512 KB).
 - Each chunk and file has a SHA1 hash for integrity verification.
 - Peers exchange chunks using TCP sockets and a custom message protocol.
-
-Directory Structure:
-├── README.md
-├── tracker/
-    └── tracker.cpp
-└── client/
-    └── client.cpp

@@ -77,20 +77,9 @@ void quit_func(int i){
     }
 }
 
-void cmd_log() {
-
-}
-
 bool isUserPresent(vector<pair<string,bool>> file_users, string user_name) {
     for (auto itr: file_users)
         if(itr.first == user_name)
-            return true;
-    return false;
-}
-
-bool isGroupMember(vector<string> members, string s){
-    for (string str: members)
-        if(str == s)
             return true;
     return false;
 }
@@ -542,11 +531,9 @@ void client_handler(int newsockfd) {
             for (int i = 0; i < fl.chunk_hashes.size(); i++) {
                 msg += fl.chunk_hashes[i] + " ";
             }
-
             for (auto& peer : fl.peer_addresses) {
                 msg += peer.first + ":" + peer.second + " ";
             }
-            
             if (fl.peer_addresses.empty()) {
                 msg = "Error No active peers available for this file";
             }

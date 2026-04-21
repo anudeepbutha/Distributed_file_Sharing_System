@@ -22,13 +22,6 @@ struct file {
     string file_path;
 };
 
-struct download_task {
-    int chunk_no;
-    bool completed;
-    string peer_ip;
-    string peer_port;
-};
-
 map<string, file> local_files;
 mutex file_mutex;
 mutex cout_mutex;
